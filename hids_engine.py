@@ -537,18 +537,22 @@ def _can_bind(iface: str) -> bool:
     except OSError: return False
 
 
-def get_interface() -> Optional[str]:
+def get_interfaces() -> List[str]:
     explicit = CFG.get("interface")
-    if explicit: return explicit
-    cands = _candidate_interfaces()
-    if os.geteuid() == 0:
-        for iface in cands:
-            if _can_bind(iface):
-                log.info("Network interface: %s", iface); return iface
+    if explicit:
+        log.info("Network interface (config): %s", explicit)
+        return [explicit]
+    if os.geteuid() != 0:
+        log.warning("Not root — network capture disabled")
+        return []
+    result = []
+    for iface in _candidate_interfaces():
+        if _can_bind(iface):
+            log.info("Network interface: %s", iface)
+            result.append(iface)
+    if not result:
         log.warning("No bindable interface — N1-N6 disabled")
-        return None
-    log.warning("Not root — network capture disabled")
-    return None
+    return result
 
 
 # --- Packet Parsing ----------------------------------------------------------
@@ -1145,10 +1149,10 @@ class HIDSEngine(threading.Thread):
         local_ips = _get_local_ips()
         log.info("Local IPs: %s", local_ips or "(none detected)")
 
-        iface = get_interface(); buf = PacketBuffer()
-        sniffer = None; net_active = False
-        if iface:
-            sniffer = Sniffer(buf, iface, local_ips)
+        ifaces = get_interfaces(); buf = PacketBuffer()
+        sniffers: List[Sniffer] = []; net_active = False
+        for iface in ifaces:
+            sniffers.append(Sniffer(buf, iface, local_ips))
 
         auth_mon = AuthLogMonitor()
         auth_poll = AuthPoller(auth_mon)
@@ -1159,6 +1163,7 @@ class HIDSEngine(threading.Thread):
         ntfy_worker.start()
 
         ntfy_ok = CFG.get("ntfy_enabled", False) and REQUESTS_OK
+        iface_label = ", ".join(ifaces) if ifaces else "N/A"
 
         _set_state(
             phase="baseline", baseline_pct=0.0, uptime_start=datetime.now(),
@@ -1166,14 +1171,16 @@ class HIDSEngine(threading.Thread):
                 "auth_log": auth_mon.available(),
                 "psutil": proc_mon.available(),
                 "fim_files": fim.file_count,
-                "iface": iface or "N/A",
+                "iface": iface_label,
                 "ntfy": ntfy_ok,
             }
         )
 
-        if sniffer:
-            sniffer.start(); time.sleep(0.5)
-            net_active = not sniffer.failed
+        for sniffer in sniffers:
+            sniffer.start()
+        if sniffers:
+            time.sleep(0.5)
+            net_active = any(not s.failed for s in sniffers)
             if not net_active:
                 mon = dict(hids_state["monitors"])
                 mon["iface"] = "N/A (needs sudo)"
@@ -1182,12 +1189,12 @@ class HIDSEngine(threading.Thread):
         auth_poll.start()
 
         db_log_system("engine_start",
-                      f"iface={iface or 'none'} net={net_active} "
+                      f"ifaces={iface_label} net={net_active} "
                       f"auth={auth_mon.available()} psutil={proc_mon.available()} "
                       f"fim={fim.file_count} ntfy={ntfy_ok}")
 
         write_alert("INFO", "engine",
-                    f"HIDS started iface={iface or 'none'} "
+                    f"HIDS started ifaces={iface_label} "
                     f"net={'yes' if net_active else 'no'} "
                     f"auth={'yes' if auth_mon.available() else 'no'} "
                     f"psutil={'yes' if proc_mon.available() else 'no'} "
@@ -1235,7 +1242,7 @@ class HIDSEngine(threading.Thread):
                     engine.evaluate(ns, af, sd, pr, susp, fim_alerts, ips)
 
         finally:
-            if sniffer: sniffer.stop()
+            for sniffer in sniffers: sniffer.stop()
             auth_poll.stop(); fim.stop(); ntfy_worker.stop()
             _set_state(phase="stopped")
             db_log_system("engine_stop", f"windows={windows}")
