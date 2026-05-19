@@ -665,7 +665,7 @@ class NetStats:
     __slots__ = ("total_rate", "syn_rate", "udp_rate", "icmp_rate",
                  "tcp_count", "syn_count", "udp_count", "icmp_count",
                  "syn_ratio", "src_port_spread", "dns_counts", "arp_replies",
-                 "total_bytes")
+                 "arp_requests", "total_bytes")
 
     def __init__(self):
         self.total_rate = 0.0; self.syn_rate = 0.0; self.udp_rate = 0.0; self.icmp_rate = 0.0
@@ -673,6 +673,7 @@ class NetStats:
         self.syn_ratio = 0.0; self.src_port_spread: Dict[str, int] = {}
         self.dns_counts: Dict[str, int] = {}
         self.arp_replies: List[str] = []
+        self.arp_requests: List[str] = []
         self.total_bytes = 0
 
 
@@ -686,6 +687,8 @@ def compute_net_stats(packets: List[Packet], w: float) -> NetStats:
         if p.is_arp:
             if p.arp_op == 2:
                 ns.arp_replies.append(p.arp_src_ip)
+            elif p.arp_op == 1:
+                ns.arp_requests.append(p.arp_src_ip)
             continue
         if p.proto == PROTO_TCP:
             ns.tcp_count += 1; src_ports[p.src_ip].add(p.dport)
@@ -819,33 +822,53 @@ _SUSP_CMD_RE = re.compile(
 
 class ProcessMonitor:
     def __init__(self):
-        self._ok = PSUTIL_OK; self._pids: Set[int] = set()
+        self._ok = PSUTIL_OK
+        self._pids: Set[int] = set()
+        self._new_count = 0
+        self._susp_pending: List[Dict] = []
         self._lock = threading.Lock()
+        self._stop = threading.Event()
         if self._ok:
             try:
                 self._pids = {p.pid for p in psutil.process_iter()}
                 log.info("Process monitor: %d PIDs tracked", len(self._pids))
+                threading.Thread(target=self._poll_loop, daemon=True,
+                                 name="proc_monitor").start()
             except Exception: self._ok = False
         if not self._ok:
             log.warning("psutil unavailable — H3/H5 disabled")
 
+    def _poll_loop(self):
+        while not self._stop.wait(0.25):
+            try:
+                cur_procs = list(psutil.process_iter(["pid", "name", "cmdline", "username"]))
+            except Exception: continue
+            cur_pids = {p.pid for p in cur_procs}
+            with self._lock:
+                new_pids = cur_pids - self._pids
+                self._pids = cur_pids
+                self._new_count += len(new_pids)
+                for p in cur_procs:
+                    if p.pid not in new_pids: continue
+                    try:
+                        name = (p.info.get("name") or "").lower()
+                        cmd = " ".join(p.info.get("cmdline") or [])
+                        user = p.info.get("username", "")
+                        if name in _SUSP_NAMES or _SUSP_CMD_RE.search(cmd):
+                            self._susp_pending.append(
+                                {"pid": p.pid, "name": name, "cmd": cmd[:120], "user": user})
+                    except (psutil.NoSuchProcess, psutil.AccessDenied): pass
+
     def count_new(self) -> Tuple[int, List[Dict]]:
         if not self._ok: return 0, []
-        try: cur_procs = list(psutil.process_iter(["pid", "name", "cmdline", "username"]))
-        except Exception: return 0, []
-        cur_pids = {p.pid for p in cur_procs}
-        new_pids = cur_pids - self._pids; self._pids = cur_pids
-        susp: List[Dict] = []
-        for p in cur_procs:
-            if p.pid not in new_pids: continue
-            try:
-                name = (p.info.get("name") or "").lower()
-                cmd = " ".join(p.info.get("cmdline") or [])
-                user = p.info.get("username", "")
-                if name in _SUSP_NAMES or _SUSP_CMD_RE.search(cmd):
-                    susp.append({"pid": p.pid, "name": name, "cmd": cmd[:120], "user": user})
-            except (psutil.NoSuchProcess, psutil.AccessDenied): pass
-        return len(new_pids), susp
+        with self._lock:
+            count = self._new_count
+            susp = list(self._susp_pending)
+            self._new_count = 0
+            self._susp_pending.clear()
+            return count, susp
+
+    def stop(self): self._stop.set()
 
     def available(self) -> bool: return self._ok
 
@@ -1014,7 +1037,7 @@ class RuleEngine:
 
     def evaluate(self, ns: NetStats, af: int, sd: int, pr: int,
                  susp_procs: List[Dict], fim: List[Tuple[str, str]],
-                 auth_ips: Dict[str, int]):
+                 auth_ips: Dict[str, int], arp_suspicious: List[str] = None):
         b = self._b
 
         # H1 Brute-force
@@ -1090,8 +1113,15 @@ class RuleEngine:
                            f"src={ip} dns_queries={count}/s thr={b.thr_dns:.0f}",
                            confirm=2, src_ip=ip)
 
-        log.debug("[WIN] syn=%.0f udp=%.0f icmp=%.0f af=%d sd=%d pr=%d fim=%d susp=%d",
-                  ns.syn_rate, ns.udp_rate, ns.icmp_rate, af, sd, pr, len(fim), len(susp_procs))
+        # N6 ARP spoofing
+        for ip in (arp_suspicious or []):
+            self._fire_now("arp_spoof", "HIGH",
+                           f"src={ip} unsolicited ARP reply (no request within 5s)",
+                           src_ip=ip)
+
+        log.debug("[WIN] syn=%.0f udp=%.0f icmp=%.0f af=%d sd=%d pr=%d fim=%d susp=%d arp=%d",
+                  ns.syn_rate, ns.udp_rate, ns.icmp_rate, af, sd, pr, len(fim), len(susp_procs),
+                  len(arp_suspicious or []))
 
 
 # --- Auth Poller -------------------------------------------------------------
@@ -1213,6 +1243,9 @@ class HIDSEngine(threading.Thread):
 
                 pkts = buf.drain()
                 ns = compute_net_stats(pkts, CFG["window_seconds"])
+                for ip in ns.arp_requests:
+                    arp_track.note_request(ip)
+                arp_suspicious = arp_track.process_replies(ns.arp_replies)
                 af, sd, ips = auth_mon.drain()
                 pr, susp = proc_mon.count_new()
                 fim_alerts = fim.drain()
@@ -1239,11 +1272,11 @@ class HIDSEngine(threading.Thread):
                         "af=%d sd=%d pr=%d fim=%d susp=%d",
                         len(pkts), ns.syn_rate, ns.udp_rate, ns.icmp_rate,
                         af, sd, pr, len(fim_alerts), len(susp))
-                    engine.evaluate(ns, af, sd, pr, susp, fim_alerts, ips)
+                    engine.evaluate(ns, af, sd, pr, susp, fim_alerts, ips, arp_suspicious)
 
         finally:
             for sniffer in sniffers: sniffer.stop()
-            auth_poll.stop(); fim.stop(); ntfy_worker.stop()
+            auth_poll.stop(); proc_mon.stop(); fim.stop(); ntfy_worker.stop()
             _set_state(phase="stopped")
             db_log_system("engine_stop", f"windows={windows}")
             log.info("Engine stopped after %d windows.", windows)

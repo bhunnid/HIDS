@@ -40,6 +40,14 @@ Open the dashboard in a browser: `http://192.168.56.108:5000`
 
 - Install the **ntfy** app on your phone (Android / iOS).
 - Subscribe to topic: `thisisulinzihidsntfytopicsoexpectnotifcations`
+- On VM1, update `~/ulinzi/ulinzi.conf` — set these two fields:
+
+```json
+"ntfy_enabled": true,
+"ntfy_topic": "thisisulinzihidsntfytopicsoexpectnotifcations",
+```
+
+- Restart the HIDS after saving the config.
 - The HIDS will push alerts automatically once attacks are detected.
 
 ---
@@ -115,7 +123,7 @@ for i in $(seq 1 30); do sudo ls /root 2>/dev/null; done
 ### H3 — Process Spawn Anomaly
 
 ```bash
-for i in $(seq 1 60); do (sleep 0.1 &); done
+for i in $(seq 1 60); do sleep 1 & done
 ```
 
 ### H4 — File Integrity Violation
