@@ -2,16 +2,12 @@
 
 **Ulinzi** is a lightweight, anomaly-based **Host Intrusion Detection System** written in
 Python. It watches a single Linux host in real time and raises alerts when activity deviates
-from a baseline of normal behaviour — no machine learning, no signatures, no heavy agent.
+from a baseline of normal behaviour.
 
 It detects **11 attack types** across the host and the network, shows them on a live web
 dashboard, persists them to SQLite, writes plain-text + JSON logs, and (optionally) pushes
 high-severity alerts to your phone via [ntfy.sh](https://ntfy.sh).
 
-> Built for the final-year project *"Ulinzi: A Lightweight Anomaly-Based Host Intrusion
-> Detection System"* (Strathmore University, School of Computing & Engineering Sciences).
-
----
 
 ## What it detects
 
@@ -61,9 +57,3 @@ builds its baselines and raises no alerts. Once the dashboard shows **Detecting*
 Runtime output (created on first run): `alerts.log`, `alerts.jsonl`, `hids.log`, `ulinzi.db`.
 
 ---
-
-## Full testing guide
-
-For the complete two-virtual-machine attack lab — VM setup, the exact `hydra` / `nmap` /
-`hping3` / `arpspoof` commands for each rule, ntfy phone setup, and troubleshooting — see
-**[DOCUMENTATION.md](DOCUMENTATION.md)**.
