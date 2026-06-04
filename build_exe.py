@@ -50,24 +50,33 @@ def main():
     ]
     run(cmd)
 
-    default_cfg = {
-        "interface": None, "baseline_seconds": 60, "window_seconds": 1,
-        "threshold_multiplier": 3, "confirm_windows": 2, "cooldown_secs": 30,
-        "file_check_interval": 5, "syn_floor": 100, "udp_floor": 500,
-        "icmp_floor": 50, "total_floor": 800, "syn_ratio_min": 0.60,
-        "port_scan_threshold": 20, "dns_query_floor": 50,
-        "auth_fail_floor": 3, "sudo_event_floor": 5, "process_spawn_floor": 20,
-        "ntfy_enabled": False, "ntfy_topic": "ulinzi-hids-CHANGE-THIS",
-        "ntfy_server": "https://ntfy.sh", "ntfy_min_level": "MEDIUM",
-        "ntfy_token": "", "alert_log": "alerts.log", "json_log": "alerts.jsonl",
-        "info_log": "hids.log", "db_path": "ulinzi.db",
-        "monitored_files": [
-            "/etc/passwd", "/etc/shadow", "/etc/sudoers",
-            "/etc/hosts", "/etc/ssh/sshd_config", "/etc/crontab"
-        ]
-    }
-    with open(os.path.join(DIST, "ulinzi.conf"), "w") as fh:
-        json.dump(default_cfg, fh, indent=2)
+    # Ship config.json (the proposal's documented configuration filename).
+    # Prefer copying the user's existing config.json so their settings carry over.
+    cfg_dest = os.path.join(DIST, "config.json")
+    if os.path.exists("config.json"):
+        shutil.copy("config.json", cfg_dest)
+    else:
+        default_cfg = {
+            "interface": None,
+            "learning_window_seconds": 60, "sampling_interval_seconds": 1,
+            "percentile_threshold": 95, "threshold_multiplier": 3,
+            "confirm_windows": 2, "cooldown_secs": 30, "file_check_interval": 5,
+            "syn_floor": 100, "udp_floor": 500, "icmp_floor": 50, "total_floor": 800,
+            "syn_ratio_threshold": 0.60, "port_scan_distinct_ports": 20,
+            "dns_query_floor": 50, "auth_fail_floor": 3, "sudo_event_floor": 5,
+            "process_spawn_floor": 20, "ntfy_enabled": False,
+            "ntfy_topic": "ulinzi-alerts-CHANGE-ME", "ntfy_server": "https://ntfy.sh",
+            "ntfy_min_level": "MEDIUM", "ntfy_token": "",
+            "alert_log": "alerts.log", "json_log": "alerts.jsonl",
+            "info_log": "hids.log", "db_path": "ulinzi.db",
+            "dashboard_host": "0.0.0.0", "dashboard_port": 5000,
+            "monitored_files": [
+                "/etc/passwd", "/etc/shadow", "/etc/sudoers",
+                "/etc/hosts", "/etc/ssh/sshd_config", "/etc/crontab"
+            ]
+        }
+        with open(cfg_dest, "w") as fh:
+            json.dump(default_cfg, fh, indent=2)
 
     run_sh = os.path.join(DIST, "run.sh")
     with open(run_sh, "w") as fh:
@@ -90,7 +99,7 @@ fi
   BUILD SUCCESSFUL
 {'=' * 50}
   Executable : {DIST}/{NAME}  ({exe_size:.1f} MB)
-  Config     : {DIST}/ulinzi.conf
+  Config     : {DIST}/config.json
   Launcher   : {DIST}/run.sh
 
   Run:

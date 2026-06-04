@@ -1,0 +1,27 @@
+# Ulinzi HIDS — runtime artifacts (regenerated on every run)
+ulinzi.db
+ulinzi.db-wal
+ulinzi.db-shm
+alerts.log
+alerts.jsonl
+alerts.log.bak
+alerts.jsonl.bak
+hids.log
+hids.log.*
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

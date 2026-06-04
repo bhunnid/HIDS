@@ -25,6 +25,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "interface":             None,
     "baseline_seconds":      60,
     "window_seconds":        1,
+    "percentile_threshold":  95,
     "threshold_multiplier":  3,
     "confirm_windows":       2,
     "cooldown_secs":         30,
@@ -48,29 +49,56 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "json_log":              "alerts.jsonl",
     "info_log":              "hids.log",
     "db_path":               "ulinzi.db",
+    "dashboard_host":        "0.0.0.0",
+    "dashboard_port":        5000,
     "monitored_files": [
         "/etc/passwd", "/etc/shadow", "/etc/sudoers",
         "/etc/hosts", "/etc/ssh/sshd_config", "/etc/crontab",
     ],
 }
 
-CONFIG_FILE = "ulinzi.conf"
+# The proposal (Appendix D) documents the configuration file as config.json with
+# human-readable key names. The engine reads config.json first and falls back to
+# the legacy ulinzi.conf if config.json is absent. Either key naming works.
+CONFIG_CANDIDATES = ("config.json", "ulinzi.conf")
+CONFIG_FILE = "config.json"
+
+# Map the proposal's documented (config.json) key names to the engine's internal
+# names, so a config file written in either style is accepted transparently.
+_CONFIG_ALIASES = {
+    "learning_window_seconds":  "baseline_seconds",
+    "sampling_interval_seconds": "window_seconds",
+    "syn_ratio_threshold":      "syn_ratio_min",
+    "port_scan_distinct_ports": "port_scan_threshold",
+}
+
 CFG: Dict[str, Any] = dict(_DEFAULT_CONFIG)
 
 
+def _normalize_config(cfg: Dict[str, Any]) -> None:
+    """Translate proposal-style keys (config.json) into internal keys in place."""
+    for alias, internal in _CONFIG_ALIASES.items():
+        if alias in cfg:
+            cfg[internal] = cfg[alias]
+
+
 def load_config() -> None:
-    global CFG
+    global CFG, CONFIG_FILE
     CFG = dict(_DEFAULT_CONFIG)
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE) as fh:
-                CFG.update(json.load(fh))
-        except Exception as e:
-            print(f"[config] Warning: {e}")
+    for cand in CONFIG_CANDIDATES:
+        if os.path.exists(cand):
+            CONFIG_FILE = cand
+            try:
+                with open(cand) as fh:
+                    CFG.update(json.load(fh))
+            except Exception as e:
+                print(f"[config] Warning: {e}")
+            break
+    _normalize_config(CFG)
 
 
 def save_default_config() -> None:
-    if not os.path.exists(CONFIG_FILE):
+    if not any(os.path.exists(c) for c in CONFIG_CANDIDATES):
         with open(CONFIG_FILE, "w") as fh:
             json.dump(_DEFAULT_CONFIG, fh, indent=2)
 
@@ -564,16 +592,16 @@ DNS_PORT = 53
 
 class Packet:
     __slots__ = ("src_ip", "dst_ip", "proto", "sport", "dport", "is_syn", "is_arp",
-                 "arp_op", "arp_src_ip", "raw_len")
+                 "arp_op", "arp_src_ip", "arp_src_mac", "raw_len")
 
     def __init__(self, src_ip: str = "", dst_ip: str = "", proto: int = 0,
                  sport: int = 0, dport: int = 0, is_syn: bool = False,
                  is_arp: bool = False, arp_op: int = 0, arp_src_ip: str = "",
-                 raw_len: int = 0):
+                 arp_src_mac: str = "", raw_len: int = 0):
         self.src_ip = src_ip; self.dst_ip = dst_ip; self.proto = proto
         self.sport = sport; self.dport = dport; self.is_syn = is_syn
         self.is_arp = is_arp; self.arp_op = arp_op; self.arp_src_ip = arp_src_ip
-        self.raw_len = raw_len
+        self.arp_src_mac = arp_src_mac; self.raw_len = raw_len
 
 
 def parse_packet(raw: bytes) -> Optional[Packet]:
@@ -583,9 +611,10 @@ def parse_packet(raw: bytes) -> Optional[Packet]:
     if eth_type == ETH_P_ARP and len(raw) >= 42:
         try:
             arp_op = struct.unpack_from("!H", raw, 20)[0]
+            arp_src_mac = ":".join(f"{b:02x}" for b in raw[22:28])
             arp_src_ip = socket.inet_ntoa(raw[28:32])
             return Packet(is_arp=True, arp_op=arp_op, arp_src_ip=arp_src_ip,
-                          raw_len=len(raw))
+                          arp_src_mac=arp_src_mac, raw_len=len(raw))
         except Exception: return None
 
     if eth_type != ETH_P_IP: return None
@@ -672,8 +701,8 @@ class NetStats:
         self.tcp_count = 0; self.syn_count = 0; self.udp_count = 0; self.icmp_count = 0
         self.syn_ratio = 0.0; self.src_port_spread: Dict[str, int] = {}
         self.dns_counts: Dict[str, int] = {}
-        self.arp_replies: List[str] = []
-        self.arp_requests: List[str] = []
+        self.arp_replies: List[Tuple[str, str]] = []
+        self.arp_requests: List[Tuple[str, str]] = []
         self.total_bytes = 0
 
 
@@ -686,9 +715,9 @@ def compute_net_stats(packets: List[Packet], w: float) -> NetStats:
         ns.total_bytes += p.raw_len
         if p.is_arp:
             if p.arp_op == 2:
-                ns.arp_replies.append(p.arp_src_ip)
+                ns.arp_replies.append((p.arp_src_ip, p.arp_src_mac))
             elif p.arp_op == 1:
-                ns.arp_requests.append(p.arp_src_ip)
+                ns.arp_requests.append((p.arp_src_ip, p.arp_src_mac))
             continue
         if p.proto == PROTO_TCP:
             ns.tcp_count += 1; src_ports[p.src_ip].add(p.dport)
@@ -948,14 +977,18 @@ class Baseline:
         self._s["dns"].append(float(max_dns))
 
     @staticmethod
-    def _p95(v: List[float]) -> float:
-        if not v: return 0.0
-        s = sorted(v); return s[max(0, int(len(s) * 0.95) - 1)]
+    def _percentile(v: List[float], pct: float = 95.0) -> float:
+        if not v:
+            return 0.0
+        s = sorted(v)
+        k = int(round((pct / 100.0) * (len(s) - 1)))
+        return s[max(0, min(k, len(s) - 1))]
 
     def finalise(self):
         m = CFG["threshold_multiplier"]
+        pct = float(CFG.get("percentile_threshold", 95))
 
-        def t(key, floor): return max(floor, self._p95(self._s[key]) * m)
+        def t(key, floor): return max(floor, self._percentile(self._s[key], pct) * m)
 
         self.thr_total = t("total", CFG["total_floor"])
         self.thr_syn = t("syn", CFG["syn_floor"])
@@ -980,21 +1013,67 @@ class Baseline:
 # --- ARP Spoof Tracker (N6) --------------------------------------------------
 
 class ARPTracker:
-    def __init__(self):
+    """N6 ARP spoofing detector.
+
+    A single unsolicited ARP reply is normal on real networks (gratuitous ARP,
+    the host's own announcements, gateway refreshes), so flagging every one of
+    them produces constant false positives. This tracker instead raises an alert
+    only on the genuine signatures of ARP cache poisoning:
+      * a known IP -> MAC binding suddenly changing (e.g. the gateway's MAC is
+        replaced by the attacker's), or
+      * a sustained burst of unsolicited replies from one IP (what arpspoof and
+        similar tools generate as they continuously re-poison the cache).
+    Replies that match the host's own IPs are always ignored.
+    """
+
+    def __init__(self, local_ips: Optional[Set[str]] = None):
         self._requests: Dict[str, float] = {}
+        self._bindings: Dict[str, str] = {}
+        self._unsolicited: Dict[str, collections.deque] = collections.defaultdict(collections.deque)
+        self._local_ips: Set[str] = set(local_ips or set())
         self._lock = threading.Lock()
 
-    def process_replies(self, arp_replies: List[str]) -> List[str]:
-        now = time.time(); suspicious = []
-        with self._lock:
-            for ip in arp_replies:
-                req_time = self._requests.get(ip, 0)
-                if now - req_time > 5.0:
-                    suspicious.append(ip)
-        return suspicious
-
     def note_request(self, ip: str):
-        with self._lock: self._requests[ip] = time.time()
+        with self._lock:
+            self._requests[ip] = time.time()
+
+    def process_replies(self, arp_replies: List[Tuple[str, str]]) -> List[Tuple[str, str, str]]:
+        now = time.time()
+        suspicious: List[Tuple[str, str, str]] = []
+        with self._lock:
+            for ip, mac in arp_replies:
+                if not ip or ip in ("0.0.0.0",) or ip in self._local_ips:
+                    if ip and mac:
+                        self._bindings[ip] = mac
+                    continue
+                req_time = self._requests.get(ip, 0)
+                solicited = (now - req_time) <= 5.0
+                prev_mac = self._bindings.get(ip)
+                if mac:
+                    self._bindings[ip] = mac
+                binding_changed = bool(prev_mac and mac and prev_mac != mac)
+
+                if solicited and not binding_changed:
+                    continue
+
+                dq = self._unsolicited[ip]
+                dq.append(now)
+                while dq and now - dq[0] > 10.0:
+                    dq.popleft()
+
+                if binding_changed:
+                    suspicious.append(
+                        (ip, mac,
+                         f"src={ip} IP->MAC binding changed {prev_mac} => {mac} "
+                         f"(ARP cache poisoning)"))
+                    dq.clear()
+                elif len(dq) >= 3:
+                    suspicious.append(
+                        (ip, mac,
+                         f"src={ip} mac={mac} {len(dq)} unsolicited ARP replies in 10s "
+                         f"(no matching request)"))
+                    dq.clear()
+        return suspicious
 
 
 # --- Rule Engine -------------------------------------------------------------
@@ -1114,10 +1193,8 @@ class RuleEngine:
                            confirm=2, src_ip=ip)
 
         # N6 ARP spoofing
-        for ip in (arp_suspicious or []):
-            self._fire_now("arp_spoof", "HIGH",
-                           f"src={ip} unsolicited ARP reply (no request within 5s)",
-                           src_ip=ip)
+        for ip, _mac, detail in (arp_suspicious or []):
+            self._fire_now("arp_spoof", "HIGH", detail, src_ip=ip)
 
         log.debug("[WIN] syn=%.0f udp=%.0f icmp=%.0f af=%d sd=%d pr=%d fim=%d susp=%d arp=%d",
                   ns.syn_rate, ns.udp_rate, ns.icmp_rate, af, sd, pr, len(fim), len(susp_procs),
@@ -1145,6 +1222,8 @@ hids_state: Dict = {
     "baseline_pct": 0.0,
     "uptime_start": None,
     "windows": 0,
+    "packets_total": 0,
+    "active_rules": 0,
     "last_ns": None,
     "monitors": {
         "auth_log": False, "psutil": False, "fim_files": 0,
@@ -1188,7 +1267,7 @@ class HIDSEngine(threading.Thread):
         auth_poll = AuthPoller(auth_mon)
         proc_mon = ProcessMonitor()
         fim = FileIntegrityMonitor()
-        arp_track = ARPTracker()
+        arp_track = ARPTracker(local_ips)
         ntfy_worker = NotificationWorker()
         ntfy_worker.start()
 
@@ -1218,6 +1297,13 @@ class HIDSEngine(threading.Thread):
 
         auth_poll.start()
 
+        active_rules = 0
+        if auth_mon.available():   active_rules += 2   # H1, H2
+        if proc_mon.available():   active_rules += 2   # H3, H5
+        if fim.file_count > 0:     active_rules += 1   # H4
+        if net_active:             active_rules += 6   # N1-N6
+        _set_state(active_rules=active_rules, packets_total=0)
+
         db_log_system("engine_start",
                       f"ifaces={iface_label} net={net_active} "
                       f"auth={auth_mon.available()} psutil={proc_mon.available()} "
@@ -1232,7 +1318,7 @@ class HIDSEngine(threading.Thread):
                     f"baseline={CFG['baseline_seconds']}s")
 
         bl = Baseline(); phase_start = time.monotonic()
-        engine: Optional[RuleEngine] = None; windows = 0
+        engine: Optional[RuleEngine] = None; windows = 0; packets_total = 0
 
         log.info("BASELINE phase — %d seconds", CFG["baseline_seconds"])
 
@@ -1243,15 +1329,16 @@ class HIDSEngine(threading.Thread):
 
                 pkts = buf.drain()
                 ns = compute_net_stats(pkts, CFG["window_seconds"])
-                for ip in ns.arp_requests:
-                    arp_track.note_request(ip)
+                for _ip, _mac in ns.arp_requests:
+                    arp_track.note_request(_ip)
                 arp_suspicious = arp_track.process_replies(ns.arp_replies)
                 af, sd, ips = auth_mon.drain()
                 pr, susp = proc_mon.count_new()
                 fim_alerts = fim.drain()
                 windows += 1
+                packets_total += len(pkts)
                 elapsed = time.monotonic() - phase_start
-                _set_state(windows=windows, last_ns=ns)
+                _set_state(windows=windows, last_ns=ns, packets_total=packets_total)
 
                 if hids_state["phase"] == "baseline":
                     bl.record(ns, af, sd, pr)

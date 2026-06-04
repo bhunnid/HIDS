@@ -4,9 +4,13 @@ from flask import Flask, render_template_string, jsonify, request, redirect, url
 
 import hids_engine as eng
 
-ALERT_LOG = eng._DEFAULT_CONFIG["alert_log"]
-PORT = int(os.environ.get("PORT", 5000))
-HOST_BIND = os.environ.get("HOST", "0.0.0.0")
+# Populate configuration up-front so the dashboard bind address/port and file
+# paths come from config.json (env vars still take precedence if set).
+eng.load_config()
+
+ALERT_LOG = eng.CFG.get("alert_log", "alerts.log")
+PORT = int(os.environ.get("PORT", eng.CFG.get("dashboard_port", 5000)))
+HOST_BIND = os.environ.get("HOST", eng.CFG.get("dashboard_host", "0.0.0.0"))
 
 app = Flask(__name__)
 threading.Thread(target=eng.start_engine, daemon=True).start()
@@ -129,6 +133,15 @@ main{overflow-y:auto;padding:1rem}
 .spark-wrap{background:var(--surf);border:1px solid var(--brd);border-radius:var(--radius);padding:.55rem .8rem}
 .spark-lbl{font-family:var(--font);font-size:.52rem;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);margin-bottom:.25rem}
 #spark{display:block;width:100%;height:42px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:.65rem;margin-bottom:.65rem}
+@media(max-width:600px){.kpis{grid-template-columns:repeat(2,1fr)}}
+.kpi{background:var(--surf);border:1px solid var(--brd);border-radius:var(--radius);padding:.75rem .95rem;position:relative;overflow:hidden}
+.kpi::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--blu)}
+.kpi.k-crit::before{background:var(--red)}.kpi.k-pkt::before{background:var(--cyn)}.kpi.k-rule::before{background:var(--vio)}
+.kpi-lbl{font-family:var(--font);font-size:.54rem;letter-spacing:.11em;text-transform:uppercase;color:var(--mut);margin-bottom:.3rem}
+.kpi-val{font-size:2.05rem;font-weight:600;line-height:1;color:var(--txt)}
+.kpi.k-crit .kpi-val{color:var(--red)}.kpi.k-pkt .kpi-val{color:var(--cyn)}.kpi.k-rule .kpi-val{color:var(--vio)}
+.kpi-sub{font-family:var(--font);font-size:.54rem;color:var(--mut);margin-top:.3rem}
 .cols3{display:grid;grid-template-columns:260px 1fr 240px;gap:1rem;align-items:start}
 @media(max-width:1100px){.cols3{grid-template-columns:1fr 2fr}}
 @media(max-width:750px){.cols3{grid-template-columns:1fr}}
@@ -269,6 +282,28 @@ main{overflow-y:auto;padding:1rem}
 <main>
 
 <div class="page active" id="page-dash">
+  <div class="kpis">
+    <div class="kpi k-total">
+      <div class="kpi-lbl">Total Alerts</div>
+      <div class="kpi-val" id="k-total">0</div>
+      <div class="kpi-sub" id="k-total-sub">since start</div>
+    </div>
+    <div class="kpi k-crit">
+      <div class="kpi-lbl">Critical Alerts</div>
+      <div class="kpi-val" id="k-crit">0</div>
+      <div class="kpi-sub" id="k-crit-sub">highest severity</div>
+    </div>
+    <div class="kpi k-pkt">
+      <div class="kpi-lbl">Packets Inspected</div>
+      <div class="kpi-val" id="k-pkt">0</div>
+      <div class="kpi-sub" id="k-pkt-sub">raw socket capture</div>
+    </div>
+    <div class="kpi k-rule">
+      <div class="kpi-lbl">Active Rules</div>
+      <div class="kpi-val" id="k-rule">0 / 11</div>
+      <div class="kpi-sub" id="k-rule-sub">H1-H5 · N1-N6</div>
+    </div>
+  </div>
   <div class="strip">
     <div class="pill pill-crit"><div class="pill-lbl">Critical</div><div class="pill-val v-crit" id="c-CRITICAL">0</div></div>
     <div class="pill pill-high"><div class="pill-lbl">High</div><div class="pill-val v-high" id="c-HIGH">0</div></div>
@@ -327,8 +362,8 @@ main{overflow-y:auto;padding:1rem}
         <table class="meta">
           <tr><td>Uptime</td><td id="mt-up">—</td></tr>
           <tr><td>Interface</td><td id="mt-if">—</td></tr>
-          <tr><td>Window</td><td>1s</td></tr>
-          <tr><td>Baseline</td><td>60s</td></tr>
+          <tr><td>Window</td><td id="mt-win">—</td></tr>
+          <tr><td>Baseline</td><td id="mt-base">—</td></tr>
           <tr><td>Alert log</td><td>alerts.log</td></tr>
           <tr><td>Database</td><td>ulinzi.db</td></tr>
           <tr><td>Last alert</td><td id="mt-last">—</td></tr>
@@ -612,10 +647,21 @@ async function poll(){
     applyMonitors(st.monitors||{},st.running);
     const uEl=document.getElementById('mt-up');if(uEl)uEl.textContent=st.uptime||'—';
     const wEl=document.getElementById('win-counter');if(wEl)wEl.textContent=(st.windows||0)+' windows';
+    const wEl2=document.getElementById('mt-win');if(wEl2)wEl2.textContent=(st.window_seconds??1)+'s';
+    const bEl2=document.getElementById('mt-base');if(bEl2)bEl2.textContent=(st.baseline_seconds??60)+'s';
     const c=mt.counts||{};
     ['CRITICAL','HIGH','MEDIUM','LOW','INFO'].forEach(k=>{const el=document.getElementById('c-'+k);if(el)el.textContent=c[k]??0;});
     document.getElementById('c-host').textContent=(mt.cat||{}).host??0;
     document.getElementById('c-net').textContent=(mt.cat||{}).network??0;
+    // KPI cards (wireframe: total alerts, critical, packets inspected, active rules)
+    const totalAlerts=(c.CRITICAL||0)+(c.HIGH||0)+(c.MEDIUM||0)+(c.LOW||0);
+    const fmt=n=>(n||0).toLocaleString();
+    const kt=document.getElementById('k-total');if(kt)kt.textContent=fmt(totalAlerts);
+    const kc=document.getElementById('k-crit');if(kc)kc.textContent=fmt(c.CRITICAL||0);
+    const kp=document.getElementById('k-pkt');if(kp)kp.textContent=fmt(st.packets_total||0);
+    const kr=document.getElementById('k-rule');if(kr)kr.textContent=(st.active_rules??0)+' / 11';
+    const krs=document.getElementById('k-rule-sub');
+    if(krs)krs.textContent=st.running?((st.monitors||{}).iface&&!String((st.monitors||{}).iface).includes('N/A')?'H1-H5 · N1-N6 armed':'H1-H5 only (no sudo)'):'engine stopped';
     if(mt.spark){sparkData=mt.spark;drawSpark(sparkData);}
     if(hl.data){hourlyData=hl.data;drawHourly(hourlyData);}
     const ns=st.last_ns||{};
@@ -762,7 +808,11 @@ def api_status():
         "phase": st.get("phase", "stopped"),
         "uptime": _uptime(),
         "windows": st.get("windows", 0),
+        "packets_total": st.get("packets_total", 0),
+        "active_rules": st.get("active_rules", 0),
         "baseline_pct": st.get("baseline_pct", 0.0),
+        "window_seconds": eng.CFG.get("window_seconds", 1),
+        "baseline_seconds": eng.CFG.get("baseline_seconds", 60),
         "last_ns": ns_d,
         "monitors": st.get("monitors", {}),
     })
