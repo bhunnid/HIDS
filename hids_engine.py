@@ -396,16 +396,6 @@ def db_log_system(event: str, detail: str = "") -> None:
 _notify_queue: List[Dict] = []
 _notify_lock = threading.Lock()
 
-_LEVEL_EMOJI = {
-    "CRITICAL": "🚨", "HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "ℹ️",
-}
-
-_RULE_EMOJI = {
-    "brute_force": "🔑", "priv_escalation": "⬆️", "proc_anomaly": "⚙️",
-    "file_integrity": "📄", "susp_process": "👾", "syn_flood": "🌊",
-    "udp_flood": "🌊", "icmp_flood": "🏓", "dns_tunnel": "🔮", "arp_spoof": "🎭",
-}
-
 
 def _should_push(level: str) -> bool:
     if not CFG.get("ntfy_enabled"): return False
@@ -428,16 +418,14 @@ def _send_ntfy(level: str, rule: str, detail: str, ts: str) -> bool:
     url = f"{server}/{topic}"
 
     display_rule = rule[5:] if rule.startswith("scan_") else rule
-    rule_emoji = _RULE_EMOJI.get(display_rule, "⚠️")
-    lv_emoji = _LEVEL_EMOJI.get(level, "⚠️")
     priority = _LEVEL_PUSH_PRIORITY.get(level, "default")
-    title = f"{lv_emoji} {level} — {display_rule.replace('_', ' ').title()}"
-    message = f"{rule_emoji} {detail}\n⏱ {ts}"
+    title = f"[{level}] {display_rule.replace('_', ' ').title()}"
+    message = f"{detail}\n{ts}"
 
     headers = {
         "Title": title,
         "Priority": priority,
-        "Tags": f"warning,ulinzi,{display_rule}",
+        "Tags": f"ulinzi,{display_rule}",
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -1251,9 +1239,9 @@ class HIDSEngine(threading.Thread):
     def stop(self): self._stop_event.set()
 
     def run(self):
-        log.info("═" * 60)
-        log.info("Ulinzi HIDS — engine starting")
-        log.info("═" * 60)
+        log.info("-" * 60)
+        log.info("Ulinzi HIDS - engine starting")
+        log.info("-" * 60)
 
         local_ips = _get_local_ips()
         log.info("Local IPs: %s", local_ips or "(none detected)")

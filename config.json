@@ -1,6 +1,5 @@
 {
   "interface": null,
-
   "learning_window_seconds": 60,
   "sampling_interval_seconds": 1,
   "percentile_threshold": 95,
@@ -8,33 +7,27 @@
   "confirm_windows": 2,
   "cooldown_secs": 30,
   "file_check_interval": 5,
-
   "syn_floor": 100,
   "udp_floor": 500,
   "icmp_floor": 50,
   "total_floor": 800,
-  "syn_ratio_threshold": 0.60,
+  "syn_ratio_threshold": 0.6,
   "port_scan_distinct_ports": 20,
   "dns_query_floor": 50,
-
   "auth_fail_floor": 3,
   "sudo_event_floor": 5,
   "process_spawn_floor": 20,
-
-  "ntfy_enabled": false,
-  "ntfy_topic": "ulinzi-alerts-CHANGE-ME-9f2a",
+  "ntfy_enabled": true,
+  "ntfy_topic": "ulinzi-brandon-7k3p9x",
   "ntfy_server": "https://ntfy.sh",
   "ntfy_min_level": "MEDIUM",
   "ntfy_token": "",
-
   "alert_log": "alerts.log",
   "json_log": "alerts.jsonl",
   "info_log": "hids.log",
   "db_path": "ulinzi.db",
-
   "dashboard_host": "0.0.0.0",
   "dashboard_port": 5000,
-
   "monitored_files": [
     "/etc/passwd",
     "/etc/shadow",
