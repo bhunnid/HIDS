@@ -302,6 +302,17 @@ def db_query_alerts(n: int = 200, level_filter: Optional[str] = None,
         return [dict(r) for r in db.execute(q, params).fetchall()]
 
 
+def db_clear_alerts() -> None:
+    """Remove all stored alerts, attacker profiles and incidents. Used by the
+    dashboard's Clear button; the system_log is preserved for audit."""
+    with _db_lock:
+        db = _get_db()
+        db.execute("DELETE FROM alerts")
+        db.execute("DELETE FROM attackers")
+        db.execute("DELETE FROM incidents")
+        db.commit()
+
+
 def db_counts() -> Dict[str, int]:
     with _db_lock:
         db = _get_db()
@@ -1017,7 +1028,7 @@ class ARPTracker:
     def __init__(self, local_ips: Optional[Set[str]] = None):
         self._requests: Dict[str, float] = {}
         self._bindings: Dict[str, str] = {}
-        self._unsolicited: Dict[str, collections.deque] = collections.defaultdict(collections.deque)
+        self._seen: Dict[str, int] = {}
         self._local_ips: Set[str] = set(local_ips or set())
         self._lock = threading.Lock()
 
@@ -1026,7 +1037,17 @@ class ARPTracker:
             self._requests[ip] = time.time()
 
     def process_replies(self, arp_replies: List[Tuple[str, str]]) -> List[Tuple[str, str, str]]:
-        now = time.time()
+        """Return genuine ARP-poisoning events.
+
+        Strategy: learn each IP -> MAC binding the first time it is seen and
+        reinforce it on every matching reply. Only raise an alert when an
+        already-established binding (seen at least twice, i.e. a MAC we have
+        confirmed is the real owner) is suddenly replaced by a different MAC --
+        the defining signature of cache poisoning, which is exactly what a tool
+        like arpspoof produces. Replies for the host's own IPs, and the first
+        sighting of any IP, never alert. This avoids the constant false
+        positives caused by ordinary gratuitous / periodic ARP on a live LAN.
+        """
         suspicious: List[Tuple[str, str, str]] = []
         with self._lock:
             for ip, mac in arp_replies:
@@ -1034,33 +1055,25 @@ class ARPTracker:
                     if ip and mac:
                         self._bindings[ip] = mac
                     continue
-                req_time = self._requests.get(ip, 0)
-                solicited = (now - req_time) <= 5.0
-                prev_mac = self._bindings.get(ip)
-                if mac:
-                    self._bindings[ip] = mac
-                binding_changed = bool(prev_mac and mac and prev_mac != mac)
-
-                if solicited and not binding_changed:
+                if not mac or mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
                     continue
-
-                dq = self._unsolicited[ip]
-                dq.append(now)
-                while dq and now - dq[0] > 10.0:
-                    dq.popleft()
-
-                if binding_changed:
+                prev = self._bindings.get(ip)
+                if prev is None:                       # first sighting -> learn silently
+                    self._bindings[ip] = mac
+                    self._seen[ip] = 1
+                    continue
+                if mac == prev:                        # same owner -> reinforce
+                    self._seen[ip] = self._seen.get(ip, 1) + 1
+                    continue
+                # MAC changed for a known IP
+                established = self._seen.get(ip, 0) >= 2
+                self._bindings[ip] = mac
+                self._seen[ip] = 1
+                if established:
                     suspicious.append(
                         (ip, mac,
-                         f"src={ip} IP->MAC binding changed {prev_mac} => {mac} "
+                         f"src={ip} IP->MAC binding changed {prev} => {mac} "
                          f"(ARP cache poisoning)"))
-                    dq.clear()
-                elif len(dq) >= 3:
-                    suspicious.append(
-                        (ip, mac,
-                         f"src={ip} mac={mac} {len(dq)} unsolicited ARP replies in 10s "
-                         f"(no matching request)"))
-                    dq.clear()
         return suspicious
 
 
@@ -1373,7 +1386,14 @@ def start_engine() -> HIDSEngine:
 
 def stop_engine():
     global _engine_ref
-    if _engine_ref: _engine_ref.stop(); _engine_ref.join(timeout=6); _engine_ref = None
+    ref = _engine_ref
+    if ref:
+        ref.stop()
+        try:
+            if ref.is_alive(): ref.join(timeout=6)
+        except RuntimeError:
+            pass
+        _engine_ref = None
 
 
 def is_running() -> bool:

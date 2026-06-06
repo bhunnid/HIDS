@@ -678,6 +678,12 @@ def stop():
 
 @app.post("/clear")
 def clear():
+    # The dashboard reads alerts from SQLite, so the database must be cleared --
+    # rotating the log files alone leaves the feed and counters unchanged.
+    try:
+        eng.db_clear_alerts()
+    except Exception:
+        pass
     try:
         if os.path.exists(ALERT_LOG):
             os.replace(ALERT_LOG, ALERT_LOG + ".bak")
